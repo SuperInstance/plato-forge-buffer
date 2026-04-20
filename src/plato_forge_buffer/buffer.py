@@ -1,120 +1,186 @@
-"""Prioritized experience replay buffer with curriculum-balanced sampling."""
-
-import json, time, random, math
+"""Forge buffer — priority ring buffer with overflow handling, backpressure, and batch drain."""
+import time
+import heapq
 from dataclasses import dataclass, field
 from typing import Optional
+from enum import Enum
+from collections import deque
+
+class BufferOverflowPolicy(Enum):
+    DROP_OLDEST = "drop_oldest"
+    DROP_LOWEST = "drop_lowest_priority"
+    BLOCK = "block"
+    EXPAND = "expand"
+
+class EntryPriority(Enum):
+    LOW = 0
+    NORMAL = 1
+    HIGH = 2
+    CRITICAL = 3
 
 @dataclass
-class Experience:
-    prompt: str
-    completion: str
-    quality: float = 0.5
-    priority: str = "P2"
-    source: str = ""
+class BufferEntry:
+    id: str
+    data: dict
+    priority: int = 1
     timestamp: float = field(default_factory=time.time)
-    use_count: int = 0
+    size: int = 1  # abstract size units
+    source: str = ""
+    room: str = ""
 
-class ExperienceBuffer:
-    def __init__(self, max_size: int = 10000, dedup_threshold: float = 0.9):
-        self._buffer: list[Experience] = []
-        self.max_size = max_size
-        self.dedup_threshold = dedup_threshold
-        self._seen_prompts: list[str] = []
+    def __lt__(self, other):
+        if self.priority != other.priority:
+            return self.priority > other.priority  # higher priority first
+        return self.timestamp < other.timestamp  # older first
 
-    def _jaccard(self, a: str, b: str) -> float:
-        sa, sb = set(a.lower().split()), set(b.lower().split())
-        if not sa and not sb: return 1.0
-        if not sa or not sb: return 0.0
-        return len(sa & sb) / len(sa | sb)
+class ForgeBuffer:
+    def __init__(self, capacity: int = 1000, overflow: str = "drop_oldest",
+                 backpressure_threshold: float = 0.8):
+        self.capacity = capacity
+        self.overflow_policy = BufferOverflowPolicy(overflow)
+        self.backpressure_threshold = backpressure_threshold
+        self._heap: list[BufferEntry] = []
+        self._entry_map: dict[str, BufferEntry] = {}
+        self._total_size: int = 0
+        self._dropped: int = 0
+        self._drained: int = 0
+        self._peak_usage: int = 0
+        self._history: deque = deque(maxlen=200)
 
-    def _is_dup(self, prompt: str) -> bool:
-        for seen in self._seen_prompts[-500:]:
-            if self._jaccard(prompt, seen) >= self.dedup_threshold:
-                return True
-        return False
-
-    def add(self, exp: Experience) -> bool:
-        if self._is_dup(exp.prompt):
-            return False
-        if len(self._buffer) >= self.max_size:
-            self._buffer.pop(0)
-            self._seen_prompts.pop(0)
-        self._buffer.append(exp)
-        self._seen_prompts.append(exp.prompt)
+    def push(self, entry_id: str, data: dict, priority: int = 1,
+             source: str = "", room: str = "", size: int = 1) -> bool:
+        if len(self._heap) >= self.capacity:
+            if not self._handle_overflow():
+                self._dropped += 1
+                return False
+        entry = BufferEntry(id=entry_id, data=data, priority=priority,
+                           source=source, room=room, size=size)
+        heapq.heappush(self._heap, entry)
+        self._entry_map[entry_id] = entry
+        self._total_size += size
+        self._peak_usage = max(self._peak_usage, len(self._heap))
         return True
 
-    def add_batch(self, experiences: list[Experience]) -> int:
-        return sum(1 for e in experiences if self.add(e))
+    def push_batch(self, entries: list[dict]) -> int:
+        pushed = 0
+        for e in entries:
+            if self.push(e.get("id", ""), e.get("data", {}),
+                        e.get("priority", 1), e.get("source", ""),
+                        e.get("room", ""), e.get("size", 1)):
+                pushed += 1
+        return pushed
 
-    def sample(self, batch_size: int, curriculum_balance: bool = True) -> list[Experience]:
-        if not self._buffer:
-            return []
-        if not curriculum_balance:
-            weights = [e.quality + 0.1 for e in self._buffer]
-            return random.choices(self._buffer, weights=weights, k=min(batch_size, len(self._buffer)))
+    def pop(self) -> Optional[BufferEntry]:
+        if not self._heap:
+            return None
+        entry = heapq.heappop(self._heap)
+        self._entry_map.pop(entry.id, None)
+        self._total_size -= entry.size
+        self._drained += 1
+        self._history.append({"action": "pop", "id": entry.id, "priority": entry.priority,
+                              "timestamp": time.time()})
+        return entry
 
-        p01 = [e for e in self._buffer if e.priority in ("P0", "P1")]
-        stale = sorted([e for e in self._buffer if e.use_count < 2], key=lambda e: e.use_count)
-        normal = [e for e in self._buffer if e.priority == "P2" and e not in stale]
+    def peek(self) -> Optional[BufferEntry]:
+        return self._heap[0] if self._heap else None
 
-        n_normal = int(batch_size * 0.7)
-        n_priority = int(batch_size * 0.2)
-        n_stale = batch_size - n_normal - n_priority
+    def drain(self, n: int = 0) -> list[BufferEntry]:
+        results = []
+        count = n if n > 0 else len(self._heap)
+        for _ in range(min(count, len(self._heap))):
+            entry = self.pop()
+            if entry:
+                results.append(entry)
+        return results
 
-        result = []
-        if normal:
-            result.extend(random.sample(normal, min(n_normal, len(normal))))
-        if p01:
-            result.extend(random.sample(p01, min(n_priority, len(p01))))
-        if stale:
-            result.extend(stale[:n_stale])
-        random.shuffle(result)
-        for e in result:
-            e.use_count += 1
-        return result[:batch_size]
+    def drain_by_room(self, room: str, limit: int = 50) -> list[BufferEntry]:
+        remaining = []
+        results = []
+        while self._heap:
+            entry = heapq.heappop(self._heap)
+            self._entry_map.pop(entry.id, None)
+            self._total_size -= entry.size
+            if entry.room == room:
+                results.append(entry)
+                self._drained += 1
+            else:
+                remaining.append(entry)
+        for entry in remaining:
+            heapq.heappush(self._heap, entry)
+            self._entry_map[entry.id] = entry
+            self._total_size += entry.size
+        return results[:limit]
 
-    def decay_priorities(self, rate: float = 0.96):
-        for e in self._buffer:
-            e.use_count = max(0, int(e.use_count * rate))
+    def get(self, entry_id: str) -> Optional[BufferEntry]:
+        return self._entry_map.get(entry_id)
 
-    def expire_stale(self, max_age_seconds: float = 86400.0):
-        cutoff = time.time() - max_age_seconds
-        before = len(self._buffer)
-        self._buffer = [e for e in self._buffer if e.timestamp >= cutoff]
-        self._seen_prompts = self._seen_prompts[before - len(self._buffer):]
+    def remove(self, entry_id: str) -> bool:
+        entry = self._entry_map.pop(entry_id, None)
+        if not entry:
+            return False
+        self._total_size -= entry.size
+        # Rebuild heap without this entry
+        self._heap = [e for e in self._heap if e.id != entry_id]
+        heapq.heapify(self._heap)
+        return True
 
-    def dedup_merge(self, other: list[Experience]) -> int:
-        return self.add_batch(other)
+    def _handle_overflow(self) -> bool:
+        if not self._heap:
+            return False
+        if self.overflow_policy == BufferOverflowPolicy.DROP_OLDEST:
+            # Find oldest entry (lowest priority, oldest timestamp)
+            oldest = min(self._heap, key=lambda e: (e.priority, -e.timestamp))
+            self.remove(oldest.id)
+            return True
+        elif self.overflow_policy == BufferOverflowPolicy.DROP_LOWEST:
+            lowest = min(self._heap, key=lambda e: e.priority)
+            self.remove(lowest.id)
+            return True
+        elif self.overflow_policy == BufferOverflowPolicy.EXPAND:
+            self.capacity = int(self.capacity * 1.5)
+            return True
+        return False  # BLOCK
+
+    @property
+    def size(self) -> int:
+        return len(self._heap)
+
+    @property
+    def total_size(self) -> int:
+        return self._total_size
+
+    @property
+    def utilization(self) -> float:
+        return len(self._heap) / max(self.capacity, 1)
+
+    @property
+    def is_under_pressure(self) -> bool:
+        return self.utilization >= self.backpressure_threshold
+
+    def by_room(self) -> dict[str, int]:
+        counts = {}
+        for entry in self._heap:
+            counts[entry.room] = counts.get(entry.room, 0) + 1
+        return counts
+
+    def by_priority(self) -> dict[int, int]:
+        counts = {}
+        for entry in self._heap:
+            counts[entry.priority] = counts.get(entry.priority, 0) + 1
+        return dict(sorted(counts.items(), reverse=True))
+
+    def resize(self, new_capacity: int):
+        self.capacity = new_capacity
+        while len(self._heap) > new_capacity:
+            self._handle_overflow()
 
     @property
     def stats(self) -> dict:
-        p_counts = {"P0": 0, "P1": 0, "P2": 0}
-        total_q = 0.0
-        stale = 0
-        for e in self._buffer:
-            p_counts[e.priority] = p_counts.get(e.priority, 0) + 1
-            total_q += e.quality
-            if e.use_count < 2:
-                stale += 1
-        return {"total": len(self._buffer), "by_priority": p_counts,
-                "avg_quality": total_q / max(len(self._buffer), 1), "stale_count": stale}
-
-    def clear(self):
-        self._buffer.clear()
-        self._seen_prompts.clear()
-
-    def export_jsonl(self, path: str):
-        with open(path, "w") as f:
-            for e in self._buffer:
-                f.write(json.dumps({"prompt": e.prompt, "completion": e.completion,
-                    "quality": e.quality, "priority": e.priority, "source": e.source,
-                    "timestamp": e.timestamp, "use_count": e.use_count}) + "\n")
-
-    def import_jsonl(self, path: str) -> int:
-        count = 0
-        with open(path) as f:
-            for line in f:
-                d = json.loads(line.strip())
-                if self.add(Experience(**{k: v for k, v in d.items() if k in Experience.__dataclass_fields__})):
-                    count += 1
-        return count
+        return {"capacity": self.capacity, "size": len(self._heap),
+                "utilization": round(self.utilization, 3),
+                "total_size_units": self._total_size,
+                "dropped": self._dropped, "drained": self._drained,
+                "peak_usage": self._peak_usage,
+                "overflow_policy": self.overflow_policy.value,
+                "by_priority": self.by_priority(),
+                "by_room": self.by_room()}
