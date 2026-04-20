@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "plato-forge-buffer"
+version = "0.1.0"
+description = "Prioritized experience replay buffer — dedup merge, curriculum-balanced sampling"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+[project.urls]
+Repository = "https://github.com/SuperInstance/plato-forge-buffer"
